@@ -83,7 +83,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake .. -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake .. -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
           cmake --build . --config Release
 
       - name: Get commit hash
@@ -146,7 +146,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake .. -DSD_BUILD_SHARED_LIBS=ON -DSD_VULKAN=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake .. -DSD_BUILD_SHARED_LIBS=ON -DSD_VULKAN=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
           cmake --build . --config Release
 
       - name: Get commit hash
@@ -177,6 +177,133 @@ jobs:
           name: sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-${{ steps.system-info.outputs.OS_TYPE }}-${{ steps.system-info.outputs.OS_NAME }}-${{ steps.system-info.outputs.OS_VERSION }}-${{ steps.system-info.outputs.CPU_ARCH }}-vulkan.zip
           path: |
             sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-${{ steps.system-info.outputs.OS_TYPE }}-${{ steps.system-info.outputs.OS_NAME }}-${{ steps.system-info.outputs.OS_VERSION }}-${{ steps.system-info.outputs.CPU_ARCH }}-vulkan.zip
+
+  musl-cmake:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build
+        id: cmake_build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.24 sh -euxc '
+            apk add --no-cache build-base cmake git linux-headers nodejs npm
+            npm install -g pnpm@10.15.1
+
+            # git refuses to read the tree because the runner user owns it, and
+            # then the build stamps an unknown commit into the binaries
+            git config --global --add safe.directory "*"
+
+            mkdir build
+            cd build
+            # libstdc++, libgcc and OpenMP are statically linked or disabled
+            # because Alpine ships them in separate packages that a minimal
+            # target may not have
+            cmake .. -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH="\$ORIGIN" -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++" -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            cmake --build . --config Release -j "$(nproc)"
+
+            # the container runs as root, hand the tree back to the runner user
+            chmod -R a+rwX .
+          '
+
+      - name: Get commit hash
+        id: commit
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+        uses: prompt/actions-commit-hash@v2
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+        run: |
+          cp ggml/LICENSE ./build/bin/ggml.txt
+          cp LICENSE ./build/bin/stable-diffusion.cpp.txt
+          zip -j sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-Linux-musl-${{ matrix.arch }}.zip ./build/bin/*
+
+      - name: Upload artifacts
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-Linux-musl-${{ matrix.arch }}.zip
+          path: |
+            sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-Linux-musl-${{ matrix.arch }}.zip
+
+  musl-cmake-vulkan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build
+        id: cmake_build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.24 sh -euxc '
+            apk add --no-cache build-base cmake git linux-headers nodejs npm \
+              vulkan-loader-dev vulkan-headers glslang shaderc spirv-tools spirv-headers
+            npm install -g pnpm@10.15.1
+
+            # git refuses to read the tree because the runner user owns it, and
+            # then the build stamps an unknown commit into the binaries
+            git config --global --add safe.directory "*"
+
+            mkdir build
+            cd build
+            # libstdc++, libgcc and OpenMP are statically linked or disabled
+            # because Alpine ships them in separate packages that a minimal
+            # target may not have
+            cmake .. -DSD_BUILD_SHARED_LIBS=ON -DSD_VULKAN=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH="\$ORIGIN" -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++" -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            cmake --build . --config Release -j "$(nproc)"
+
+            # the container runs as root, hand the tree back to the runner user
+            chmod -R a+rwX .
+          '
+
+      - name: Get commit hash
+        id: commit
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+        uses: prompt/actions-commit-hash@v2
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+        run: |
+          cp ggml/LICENSE ./build/bin/ggml.txt
+          cp LICENSE ./build/bin/stable-diffusion.cpp.txt
+          zip -j sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-Linux-musl-${{ matrix.arch }}-vulkan.zip ./build/bin/*
+
+      - name: Upload artifacts
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-Linux-musl-${{ matrix.arch }}-vulkan.zip
+          path: |
+            sd-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-Linux-musl-${{ matrix.arch }}-vulkan.zip
 
   build-and-push-docker-images:
     name: Build and push container images
@@ -731,6 +858,8 @@ jobs:
     needs:
       - ubuntu-latest-cmake
       - ubuntu-latest-cmake-vulkan
+      - musl-cmake
+      - musl-cmake-vulkan
       - ubuntu-latest-rocm
       - build-and-push-docker-images
       - macOS-latest-cmake
